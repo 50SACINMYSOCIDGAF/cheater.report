@@ -4,12 +4,9 @@ import asyncio
 import os
 import yaml
 import time
-import json
-from typing import Dict, Any, Optional, List, Tuple, Set
-from datetime import datetime
+from typing import Dict, Any, Optional, List, Tuple
 import aiohttp
-import sqlite3
-from collections import defaultdict, deque
+from collections import OrderedDict
 
 import bungio
 from bungio.client import Client
@@ -17,15 +14,10 @@ from bungio.models import (
     BungieMembershipType,
     DestinyActivityModeType,
     DestinyUser,
-    DestinyPostGameCarnageReportData,
-    DestinyHistoricalStatsAccountResult
+    DestinyPostGameCarnageReportData
 )
-
-# Import SQLAlchemy for AsyncEngine
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
-import sqlalchemy
-
-from manifest_manager import ManifestManager
+# Add SQLAlchemy imports
+from sqlalchemy.ext.asyncio import create_async_engine
 
 logger = logging.getLogger("cheat_detector")
 
@@ -40,80 +32,78 @@ class BungioClient:
         self.max_cache_size = config["api_settings"]["max_cache_size"]
         self.rate_limit = config["api_settings"]["rate_limit_per_second"]
 
-        # Create SQLAlchemy async engine for manifest storage
-        # Convert file path to sqlite URL
-        manifest_url = f"sqlite+aiosqlite:///{self.manifest_path}"
-        self.engine = create_async_engine(manifest_url)
+        # Create AsyncEngine for manifest storage
+        if self.manifest_path.startswith(('sqlite://', 'sqlite+aiosqlite://')):
+            # It's already a SQLAlchemy URL
+            manifest_engine = create_async_engine(self.manifest_path)
+        else:
+            # It's a file path, convert to SQLAlchemy URL
+            manifest_engine = create_async_engine(f"sqlite+aiosqlite:///{self.manifest_path}")
 
-        # Initialize BungIO client with the engine
+        # Initialize client with the AsyncEngine
         self.client = Client(
             bungie_token=self.api_key,
             bungie_client_id="",  # Not needed for read-only API operations
             bungie_client_secret="",  # Not needed for read-only API operations
-            manifest_storage=self.engine  # Pass engine instead of string path
+            manifest_storage=manifest_engine
         )
 
-        # Initialize manifest manager
-        self.manifest_manager = ManifestManager(self.api_key, self.manifest_path)
+        # Set up caches with OrderedDict for FIFO behavior
+        self.pgcr_cache = OrderedDict()
+        self.player_cache = OrderedDict()
 
-        # Set up caches
-        self.pgcr_cache = {}
-        self.player_cache = {}
-
-        # Game mode mapping
-        self.game_mode_names = config["processing"]["game_mode_names"]
-
-        # Print all available enum values to help with debugging
-        self._print_available_enums()
-
-        # Fixed: Use correct DestinyActivityModeType enum values
+        # Game mode mapping - fixed PVP_COMPETITIVE to PV_P_COMPETITIVE
         self.game_mode_types = {
             "trials": DestinyActivityModeType.TRIALS_OF_OSIRIS,
-            "competitive": DestinyActivityModeType.PV_P_COMPETITIVE,  # Fixed enum name
+            "competitive": DestinyActivityModeType.PV_P_COMPETITIVE,  # Fixed naming
             "iron_banner": DestinyActivityModeType.IRON_BANNER,
             "control": DestinyActivityModeType.CONTROL,
             "rumble": DestinyActivityModeType.RUMBLE,
             "elimination": DestinyActivityModeType.ELIMINATION
         }
 
-        # Rate limiting
-        self.request_limiter = asyncio.Semaphore(self.rate_limit)
-        self.last_requests = deque(maxlen=self.rate_limit)
-
-    def _print_available_enums(self):
-        """Print all available DestinyActivityModeType enum values"""
-        logger.info("All available DestinyActivityModeType values:")
-        for name, value in DestinyActivityModeType.__members__.items():
-            logger.info(f"  {name}: {value.value}")
+        # Rate limiting with lock to ensure thread safety
+        self.request_times = []
+        self.request_lock = asyncio.Lock()
 
     async def initialize(self):
         """Initialize the client by loading manifest data"""
-        await self.manifest_manager.load_manifest()
+        try:
+            await self.client.api.get_destiny_manifest()
+            logger.info("Successfully loaded Destiny manifest")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load Destiny manifest: {str(e)}")
+            return False
 
     async def _rate_limited_request(self, coro):
         """Execute a coroutine with rate limiting"""
-        now = time.time()
+        async with self.request_lock:
+            now = time.time()
 
-        # Check if we need to wait for rate limit
-        if len(self.last_requests) >= self.rate_limit:
-            oldest = self.last_requests[0]
-            time_since_oldest = now - oldest
+            # Remove request times older than 1 second
+            self.request_times = [t for t in self.request_times if now - t < 1.0]
 
-            if time_since_oldest < 1.0:
-                wait_time = 1.0 - time_since_oldest
-                await asyncio.sleep(wait_time)
+            # Wait if at rate limit
+            if len(self.request_times) >= self.rate_limit:
+                wait_time = 1.0 - (now - self.request_times[0])
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
 
-        # Add current request time
-        self.last_requests.append(time.time())
+            # Add current request time
+            self.request_times.append(time.time())
 
-        # Execute the coroutine with semaphore
-        async with self.request_limiter:
+        try:
             return await coro
+        except Exception as e:
+            logger.error(f"API request failed: {str(e)}")
+            raise
 
-    async def search_player_by_name(self, name: str) -> Optional[DestinyUser]:
-        """Search for a player by their Bungie name"""
+    async def search_player_by_name(self, name: str) -> Tuple[Optional[DestinyUser], Optional[BungieMembershipType]]:
+        """Search for a player by their Bungie name and return both the user and the correct membership type"""
         if name in self.player_cache:
-            return self.player_cache[name]
+            cached_user, cached_membership_type = self.player_cache[name]
+            return cached_user, cached_membership_type
 
         try:
             # Parse Bungie name
@@ -155,10 +145,13 @@ class BungioClient:
 
                             # Try each result until we find an active Destiny 2 account
                             for player_data in data["Response"]:
-                                # Create DestinyUser object
+                                # Get the actual membership type from the response
+                                actual_membership_type = BungieMembershipType(player_data["membershipType"])
+
+                                # Create DestinyUser object with the correct membership type
                                 user = DestinyUser(
                                     membership_id=player_data["membershipId"],
-                                    membership_type=BungieMembershipType(player_data["membershipType"])
+                                    membership_type=actual_membership_type
                                 )
 
                                 # Verify account exists by checking for characters
@@ -171,15 +164,20 @@ class BungioClient:
                                     if profile and profile.characters and profile.characters.data:
                                         # Valid profile found
                                         logger.info(
-                                            f"Found player {name} with ID {user.membership_id} on platform {membership_type}")
+                                            f"Found player {name} with ID {user.membership_id} on platform {actual_membership_type.name}")
 
-                                        # Cache result
-                                        self.player_cache[name] = user
-                                        return user
+                                        # Cache result with correct membership type
+                                        self.player_cache[name] = (user, actual_membership_type)
+
+                                        # Maintain cache size
+                                        if len(self.player_cache) > self.max_cache_size:
+                                            self.player_cache.popitem(last=False)
+
+                                        return user, actual_membership_type
 
                                 except Exception as e:
                                     logger.debug(
-                                        f"Profile check failed for {name} on platform {membership_type}: {str(e)}")
+                                        f"Profile check failed for {name} on platform {actual_membership_type.name}: {str(e)}")
                                     continue
 
                 except Exception as e:
@@ -187,35 +185,58 @@ class BungioClient:
                     continue
 
             logger.warning(f"Could not find active Destiny 2 account for {name} on any platform")
-            return None
+            return None, None
 
         except Exception as e:
             logger.error(f"Error searching for player {name}: {str(e)}")
-            return None
+            return None, None
 
-    async def get_pgcr(self, activity_id: str) -> Optional[DestinyPostGameCarnageReportData]:
+    async def get_pgcr(self, activity_id: str) -> Optional[Dict[str, Any]]:
         """Get post-game carnage report for an activity"""
+        # Ensure activity_id is a string
+        activity_id = str(activity_id)
+
         if activity_id in self.pgcr_cache:
             return self.pgcr_cache[activity_id]
 
         try:
-            # Get PGCR data
-            pgcr = await self._rate_limited_request(
-                self.client.api.get_post_game_carnage_report(activity_id=activity_id)
-            )
+            # Make direct API call instead of using bungio to ensure proper handling
+            headers = {"X-API-Key": self.api_key}
+            url = f"https://www.bungie.net/Platform/Destiny2/Stats/PostGameCarnageReport/{activity_id}/"
 
-            if not pgcr or not pgcr.response:
-                logger.warning(f"No PGCR found for activity {activity_id}")
-                return None
+            async with aiohttp.ClientSession() as session:
+                async with self.request_lock:
+                    # Implement rate limiting
+                    now = time.time()
+                    self.request_times = [t for t in self.request_times if now - t < 1.0]
 
-            # Cache result
-            if len(self.pgcr_cache) >= self.max_cache_size:
-                # Remove oldest entry
-                self.pgcr_cache.pop(next(iter(self.pgcr_cache)))
+                    if len(self.request_times) >= self.rate_limit:
+                        wait_time = 1.0 - (now - self.request_times[0])
+                        if wait_time > 0:
+                            await asyncio.sleep(wait_time)
 
-            self.pgcr_cache[activity_id] = pgcr.response
+                    self.request_times.append(time.time())
 
-            return pgcr.response
+                    # Make the request
+                    async with session.get(url, headers=headers) as response:
+                        if response.status != 200:
+                            logger.warning(f"PGCR API returned status {response.status} for activity {activity_id}")
+                            return None
+
+                        data = await response.json()
+
+                        if data.get("ErrorCode", 0) != 1 or not data.get("Response"):
+                            logger.warning(f"No PGCR found for activity {activity_id}")
+                            return None
+
+                        # Cache result
+                        self.pgcr_cache[activity_id] = data["Response"]
+
+                        # Maintain cache size
+                        if len(self.pgcr_cache) > self.max_cache_size:
+                            self.pgcr_cache.popitem(last=False)
+
+                        return data["Response"]
 
         except Exception as e:
             logger.error(f"Error getting PGCR {activity_id}: {str(e)}")
@@ -240,43 +261,78 @@ class BungioClient:
 
             # Default to all PvP modes if none specified
             if not modes:
-                modes = [DestinyActivityModeType.ALL_PVP]
+                modes = [DestinyActivityModeType.ALL_PV_P]
 
             # For each character, get activity history for each mode
             for character_id in profile.characters.data:
                 for mode in modes:
                     try:
-                        # Use the proper API call for activity history
-                        response = await self._rate_limited_request(
-                            self.client.api.get_activity_history(
-                                character_id=character_id,
-                                destiny_membership_id=user.membership_id,
-                                membership_type=user.membership_type,
-                                count=count // len(modes),  # Distribute count across modes
-                                mode=mode,
-                                page=0
-                            )
-                        )
+                        # Use direct API call to ensure proper handling
+                        headers = {"X-API-Key": self.api_key}
 
-                        # Process activities if we got a result
-                        if response and hasattr(response, "activities"):
-                            for activity in response.activities:
-                                # Extract relevant details
-                                activity_data = {
-                                    "activityDetails": {
-                                        "instanceId": activity.activity_details.instance_id,
-                                        "mode": activity.activity_details.mode,
-                                        "referenceId": activity.activity_details.reference_id,
-                                        "directorActivityHash": activity.activity_details.director_activity_hash,
-                                        "activityDurationSeconds": getattr(activity, "activity_duration_seconds", 0)
-                                    },
-                                    "period": str(activity.period)
-                                }
-                                activities.append(activity_data)
+                        # Ensure we're using the correct membership type that matches the provided user
+                        membership_type_value = user.membership_type.value
 
-                                # Stop if we've reached our target count
-                                if len(activities) >= count:
-                                    break
+                        url = f"https://www.bungie.net/Platform/Destiny2/{membership_type_value}/Account/{user.membership_id}/Character/{character_id}/Stats/Activities/"
+                        params = {
+                            "mode": mode.value,
+                            "count": count // len(modes),
+                            "page": 0
+                        }
+
+                        logger.debug(
+                            f"Requesting activities for user {user.membership_id} with membership type {user.membership_type.name}")
+
+                        async with aiohttp.ClientSession() as session:
+                            async with self.request_lock:
+                                # Implement rate limiting
+                                now = time.time()
+                                self.request_times = [t for t in self.request_times if now - t < 1.0]
+
+                                if len(self.request_times) >= self.rate_limit:
+                                    wait_time = 1.0 - (now - self.request_times[0])
+                                    if wait_time > 0:
+                                        await asyncio.sleep(wait_time)
+
+                                self.request_times.append(time.time())
+
+                                # Make the request
+                                async with session.get(url, headers=headers, params=params) as response:
+                                    if response.status != 200:
+                                        logger.warning(f"Activity history API returned status {response.status}")
+                                        continue
+
+                                    data = await response.json()
+
+                                    if data.get("ErrorCode", 0) != 1 or not data.get("Response") or not data[
+                                        "Response"].get("activities"):
+                                        logger.debug(f"No activities found for character {character_id}, mode {mode}")
+                                        continue
+
+                                    # Process activities
+                                    for activity in data["Response"]["activities"]:
+                                        # Extract relevant details
+                                        activity_data = {
+                                            "activityDetails": {
+                                                "instanceId": activity["activityDetails"]["instanceId"],
+                                                "mode": activity["activityDetails"]["mode"],
+                                                "referenceId": activity["activityDetails"]["referenceId"],
+                                                "directorActivityHash": activity["activityDetails"].get(
+                                                    "directorActivityHash", 0),
+                                            },
+                                            "period": activity["period"]
+                                        }
+
+                                        # Add activity duration if available
+                                        if "activityDurationSeconds" in activity:
+                                            activity_data["activityDetails"]["activityDurationSeconds"] = activity[
+                                                "activityDurationSeconds"]
+
+                                        activities.append(activity_data)
+
+                                        # Stop if we've reached our target count
+                                        if len(activities) >= count:
+                                            break
 
                     except Exception as e:
                         logger.warning(f"Error getting activities for character {character_id}, mode {mode}: {str(e)}")
@@ -297,7 +353,7 @@ class BungioClient:
         seed_matches.update(known_pgcrs)
         logger.info(f"Added {len(known_pgcrs)} known PGCR IDs with confirmed cheaters")
 
-        # Add known public cheaters - use the proper enum value for Steam
+        # Add known public cheaters - using proper enum values
         known_cheaters = [
             ("4611686018540389245", BungieMembershipType.TIGER_STEAM),  # Known public cheater on Steam
             ("4611686018512740742", BungieMembershipType.TIGER_STEAM)  # Known public cheater on Steam
@@ -319,7 +375,7 @@ class BungioClient:
                 for activity in activities:
                     instance_id = activity.get("activityDetails", {}).get("instanceId")
                     if instance_id:
-                        seed_matches.add(instance_id)
+                        seed_matches.add(str(instance_id))
 
                 successful_players += 1
                 if activities:
@@ -331,17 +387,17 @@ class BungioClient:
         # Try the list of potentially private accounts
         for name in cheater_names:
             try:
-                # Find player
-                player = await self.search_player_by_name(name)
+                # Find player with correct membership type
+                player, membership_type = await self.search_player_by_name(name)
 
                 if not player:
                     logger.warning(f"Could not find player: {name}")
                     continue
 
                 successful_players += 1
-                logger.info(f"Found player {name} (ID: {player.membership_id})")
+                logger.info(f"Found player {name} (ID: {player.membership_id}) on platform {membership_type.name}")
 
-                # Try getting activities
+                # Try getting activities with correct membership type
                 activities = await self.get_player_recent_activities(
                     user=player,
                     modes=[self.game_mode_types["trials"]],
@@ -352,7 +408,7 @@ class BungioClient:
                 for activity in activities:
                     instance_id = activity.get("activityDetails", {}).get("instanceId")
                     if instance_id:
-                        seed_matches.add(instance_id)
+                        seed_matches.add(str(instance_id))
 
                 if activities:
                     logger.info(f"Found {len(activities)} activities for {name}")
@@ -372,149 +428,3 @@ class BungioClient:
             seed_matches.update(fallback_matches)
 
         return list(seed_matches)
-
-    # Extract player metrics from PGCR
-    async def extract_player_metrics(self, pgcr: DestinyPostGameCarnageReportData) -> Dict[str, Dict[str, Any]]:
-        """Extract relevant metrics from PGCR data for cheat detection"""
-        if not pgcr or not pgcr.entries:
-            return {}
-
-        metrics = {}
-        game_duration_seconds = getattr(pgcr, "activity_duration_seconds", 0)
-        if not game_duration_seconds and hasattr(pgcr, "period") and hasattr(pgcr, "activity_end_time_offset_seconds"):
-            # Calculate from period and end time offset
-            try:
-                end_time_offset = pgcr.activity_end_time_offset_seconds
-                period = datetime.fromisoformat(str(pgcr.period).replace('Z', '+00:00'))
-                game_duration_seconds = end_time_offset
-            except:
-                game_duration_seconds = 0
-
-        game_duration_minutes = game_duration_seconds / 60.0
-
-        # Get game mode
-        mode_hash = getattr(pgcr, "activity_details", {}).get("director_activity_hash", 0)
-        mode_type = self.manifest_manager.get_game_mode(mode_hash)
-
-        for entry in pgcr.entries:
-            try:
-                player = entry.player
-                if not player or not player.destiny_user_info:
-                    continue
-
-                # Create unique player ID
-                player_id = f"{player.destiny_user_info.display_name}#{player.destiny_user_info.membership_id}"
-
-                # Extract basic stats
-                metrics[player_id] = {
-                    "heavy_kills": 0,
-                    "super_kills": 0,
-                    "game_duration": game_duration_minutes,
-                    "game_mode": mode_type,
-                    "headshot_ratio_by_weapon": {},
-                    "score": getattr(entry.score, "basic", {}).get("value", 0),
-                    "kills": getattr(entry.values.get("kills", {}), "basic", {}).get("value", 0),
-                    "deaths": getattr(entry.values.get("deaths", {}), "basic", {}).get("value", 0),
-                    "assists": getattr(entry.values.get("assists", {}), "basic", {}).get("value", 0),
-                    "kill_death_ratio": getattr(entry.values.get("killsDeathsRatio", {}), "basic", {}).get("value", 0),
-                    "efficiency": getattr(entry.values.get("efficiency", {}), "basic", {}).get("value", 0),
-                    "longest_streak": getattr(entry.extended.get("values", {}).get("longestKillSpree", {}), "basic",
-                                              {}).get("value", 0),
-                }
-
-                # Extract weapon-specific stats
-                if hasattr(entry, "extended") and hasattr(entry.extended, "weapons"):
-                    for weapon in entry.extended.weapons:
-                        try:
-                            # Get weapon type from manifest
-                            weapon_hash = weapon.reference_id
-                            weapon_type = self.manifest_manager.get_weapon_type(weapon_hash)
-
-                            # Extract precision stats
-                            precision_kills = getattr(weapon.values.get("precisionKills", {}), "basic", {}).get("value",
-                                                                                                                0)
-                            total_kills = getattr(weapon.values.get("uniqueWeaponKills", {}), "basic", {}).get("value",
-                                                                                                               0)
-
-                            if total_kills > 0:
-                                headshot_ratio = precision_kills / total_kills
-                                metrics[player_id]["headshot_ratio_by_weapon"][weapon_type] = headshot_ratio
-
-                            # Check if this is a heavy weapon
-                            if weapon.is_heavy_weapon:
-                                metrics[player_id]["heavy_kills"] += total_kills
-                        except Exception as e:
-                            logger.warning(f"Error processing weapon: {str(e)}")
-
-                # Extract ability/super kills
-                if hasattr(entry, "extended") and hasattr(entry.extended, "values"):
-                    values = entry.extended.values
-
-                    # Check for super kills from various stats
-                    super_kills = getattr(values.get("weaponKillsSuper", {}), "basic", {}).get("value", 0)
-                    if not super_kills:
-                        # Try alternative stats
-                        super_kills = getattr(values.get("weaponKillsAbility", {}), "basic", {}).get("value", 0)
-
-                    metrics[player_id]["super_kills"] = super_kills
-
-                    # If heavy kills not set from weapons, try to get from stats
-                    if metrics[player_id]["heavy_kills"] == 0:
-                        heavy_kills = getattr(values.get("weaponKillsHeavy", {}), "basic", {}).get("value", 0)
-                        metrics[player_id]["heavy_kills"] = heavy_kills
-
-            except Exception as e:
-                logger.error(f"Error extracting metrics for player in PGCR: {str(e)}")
-
-        return metrics
-
-    async def send_discord_alert(self, webhook_url: str, player_name: str, evidence_pgcrs: List[str],
-                                 suspicion_score: float, flags: Dict[str, Any]) -> None:
-        """Send a Discord webhook alert for a detected cheater"""
-        try:
-            # Create embed with evidence
-            embed = {
-                "title": f"🚨 Possible Cheater Detected: {player_name}",
-                "color": 16711680,  # Red
-                "description": f"Suspicion Score: {suspicion_score:.2f}/1.00\n\n**Suspicious Activities:**",
-                "fields": []
-            }
-
-            # Add flags as fields
-            for flag_type, details in flags.items():
-                if isinstance(details, dict):
-                    value = "\n".join(f"- {k}: {v}" for k, v in details.items())
-                else:
-                    value = str(details)
-
-                embed["fields"].append({
-                    "name": flag_type.replace("_", " ").title(),
-                    "value": value,
-                    "inline": True
-                })
-
-            # Add evidence links
-            evidence_links = "\n".join(f"[Match #{i + 1}](https://www.bungie.net/en/PGCR/{pgcr})"
-                                       for i, pgcr in enumerate(evidence_pgcrs[:5]))
-
-            embed["fields"].append({
-                "name": "Evidence (PGCRs)",
-                "value": evidence_links if evidence_links else "No specific evidence links",
-                "inline": False
-            })
-
-            payload = {
-                "content": f"Possible cheater detected: {player_name}",
-                "embeds": [embed]
-            }
-
-            # Send webhook
-            async with aiohttp.ClientSession() as session:
-                async with session.post(webhook_url, json=payload) as resp:
-                    if resp.status != 204:
-                        logger.error(f"Failed to send Discord alert: {resp.status}")
-                    else:
-                        logger.info(f"Sent cheater alert for {player_name}")
-
-        except Exception as e:
-            logger.error(f"Error sending Discord alert: {str(e)}")

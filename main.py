@@ -12,9 +12,8 @@ import signal
 import threading
 
 from bungio_client import BungioClient
-from bayesian_detector import BayesianDetector
-from graph_manager import GraphManager
-from worker import Worker
+from data_processor import DataProcessor
+from queue_mananger import QueueManager
 
 # Configure logging
 logging.basicConfig(
@@ -29,140 +28,229 @@ logging.basicConfig(
 logger = logging.getLogger("cheat_detector")
 
 
-class CheatDetector:
+class CheatDetectorPipeline:
     def __init__(self, config_path: str = "config.yml"):
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
 
         # Initialize components
         self.api_client = BungioClient(config_path)
-        self.bayesian_detector = BayesianDetector(config_path)
-        self.graph_manager = GraphManager(config_path, self.bayesian_detector)
+        self.data_processor = DataProcessor(config_path)
+        self.queue_manager = QueueManager(config_path)
 
         # Settings
-        self.webhook_url = self.config["discord_webhook"]["url"]
-        self.min_confidence = self.config["discord_webhook"]["min_confidence_to_report"]
-        self.worker_count = self.config["processing"]["worker_threads"]
+        self.worker_count = self.config["processing"].get("worker_threads", 4)
         self.known_cheaters = self.config.get("known_cheaters", [])
-
-        # Worker threads
-        self.workers = []
+        self.data_output_dir = self.config["processing"].get("data_output_dir", "data")
 
         # Runtime state
         self.running = False
         self.shutdown_event = threading.Event()
-        self.global_stats = {
+        self.stats = {
             "start_time": time.time(),
-            "matches_processed": 0,
-            "cheaters_detected": 0,
+            "games_processed": 0,
+            "games_queued": 0,
             "api_errors": 0,
             "last_update": time.time()
         }
 
+        # Create output directory if it doesn't exist
+        os.makedirs(self.data_output_dir, exist_ok=True)
+
     async def initialize(self):
-        """Initialize the detector by loading manifest and finding seed matches"""
-        # Initialize API client (load manifest)
-        await self.api_client.initialize()
+        """Initialize the pipeline by finding seed matches"""
+        # Initialize API client
+        logger.info("Initializing Bungie API client...")
+        if not await self.api_client.initialize():
+            logger.error("Failed to initialize API client!")
+            return False
 
         # Find seed matches from known cheaters
+        logger.info(f"Finding seed matches from known cheaters...")
         seed_matches = await self.api_client.get_seed_matches_from_cheaters(self.known_cheaters)
 
-        # Add seed matches to frontier
-        self.graph_manager.update_frontier(seed_matches)
+        # Queue seed matches
+        logger.info(f"Queueing {len(seed_matches)} seed matches...")
+        count = self.queue_manager.queue_games(seed_matches, priority=1.0)
+        logger.info(f"Successfully queued {count} seed matches")
 
-        # Queue seed matches with high priority
-        for match_id in seed_matches:
-            self.graph_manager.queue_match_for_analysis(match_id, priority=-0.9)
+        return count > 0
 
-        logger.info(f"Initialized with {len(seed_matches)} seed matches")
-
-    def start_workers(self):
-        """Start worker threads"""
-        for i in range(self.worker_count):
-            worker = Worker(
-                i,
-                self.api_client,
-                self.graph_manager,
-                self.bayesian_detector,
-                self.webhook_url,
-                self.min_confidence
-            )
-            worker.start()
-            self.workers.append(worker)
-            logger.info(f"Started worker {i}")
-
-    def stop_workers(self):
-        """Stop all worker threads"""
-        for worker in self.workers:
-            worker.stop()
-
-        # Wait for workers to finish
-        for worker in self.workers:
-            worker.join(timeout=2.0)
-
-        logger.info("All workers stopped")
-
-    def update_global_stats(self):
-        """Update global statistics from workers"""
-        self.global_stats["matches_processed"] = sum(w.stats["matches_processed"] for w in self.workers)
-        self.global_stats["cheaters_detected"] = sum(w.stats["cheaters_detected"] for w in self.workers)
-        self.global_stats["api_errors"] = sum(w.stats["api_errors"] for w in self.workers)
-        self.global_stats["last_update"] = time.time()
-        self.global_stats["runtime_seconds"] = time.time() - self.global_stats["start_time"]
-
-        # Calculate processing rate
-        runtime = self.global_stats["runtime_seconds"]
-        if runtime > 0:
-            self.global_stats["matches_per_second"] = self.global_stats["matches_processed"] / runtime
-        else:
-            self.global_stats["matches_per_second"] = 0
-
-    def print_stats(self):
-        """Print runtime statistics"""
-        self.update_global_stats()
-
-        runtime = self.global_stats["runtime_seconds"]
-        hours = int(runtime // 3600)
-        minutes = int((runtime % 3600) // 60)
-        seconds = int(runtime % 60)
-
-        logger.info(f"=== Stats after {hours:02d}:{minutes:02d}:{seconds:02d} ===")
-        logger.info(f"Matches processed: {self.global_stats['matches_processed']}")
-        logger.info(f"Cheaters detected: {self.global_stats['cheaters_detected']}")
-        logger.info(f"API errors: {self.global_stats['api_errors']}")
-        logger.info(f"Processing rate: {self.global_stats['matches_per_second']:.2f} matches/second")
-
-        # Print graph statistics
-        self.graph_manager.print_statistics()
-
-        # Print worker details
-        active_workers = sum(1 for w in self.workers if time.time() - w.stats["last_activity"] < 60)
-        logger.info(f"Workers: {active_workers} active out of {len(self.workers)}")
-
-    def save_state(self, filename: str = "detector_state.json"):
-        """Save detector state to file"""
+    async def process_game(self, game_id: str) -> bool:
+        """Process a single game, extract data, and save to disk"""
         try:
-            # Get suspicious players
-            suspicious_players = self.graph_manager.get_suspicious_player_metrics(min_suspicion=0.5)
+            logger.info(f"Processing game {game_id}...")
 
-            # Prepare state
-            state = {
+            # Get PGCR data
+            pgcr_data = await self.api_client.get_pgcr(game_id)
+
+            if not pgcr_data:
+                logger.warning(f"No PGCR data found for game {game_id}")
+                self.stats["api_errors"] += 1
+                return False
+
+            # Extract player metrics
+            player_metrics = self.data_processor.extract_player_metrics(pgcr_data)
+
+            if not player_metrics:
+                logger.warning(f"No player metrics found for game {game_id}")
+                return False
+
+            # Save data to disk
+            self.save_game_data(game_id, player_metrics)
+
+            # Queue connected games
+            await self.queue_connected_games(game_id, player_metrics)
+
+            # Mark as processed
+            self.queue_manager.mark_game_processed(game_id)
+
+            # Update stats
+            self.stats["games_processed"] += 1
+
+            logger.info(f"Successfully processed game {game_id} with {len(player_metrics)} players")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error processing game {game_id}: {str(e)}")
+            self.queue_manager.mark_game_failed(game_id)
+            return False
+
+    def save_game_data(self, game_id: str, player_metrics: Dict[str, Dict[str, Any]]) -> bool:
+        """Save game data to disk"""
+        try:
+            # Create output file path
+            file_path = os.path.join(self.data_output_dir, f"game_{game_id}.json")
+
+            # Create data structure
+            game_data = {
+                "game_id": game_id,
                 "timestamp": time.time(),
-                "stats": self.global_stats,
-                "suspicious_players": suspicious_players,
-                "worker_stats": [w.get_stats() for w in self.workers]
+                "player_metrics": player_metrics
             }
 
             # Write to file
-            with open(filename, "w") as f:
-                json.dump(state, f, indent=2)
+            with open(file_path, "w") as f:
+                json.dump(game_data, f, indent=2)
 
-            logger.info(f"State saved to {filename}")
+            return True
 
         except Exception as e:
-            logger.error(f"Error saving state: {str(e)}")
+            logger.error(f"Error saving game data for {game_id}: {str(e)}")
+            return False
 
-    def setup_signal_handlers(self):
+    async def queue_connected_games(self, game_id: str, player_metrics: Dict[str, Dict[str, Any]]) -> int:
+        """Find and queue games connected to players in the current game"""
+        queued_count = 0
+
+        try:
+            # For each player, get their recent games
+            for player_id in player_metrics:
+                # Skip if invalid player ID
+                if "#" not in player_id:
+                    continue
+
+                display_name, membership_id = player_id.split("#", 1)
+
+                try:
+                    # Search for the player to get the correct membership type
+                    bungie_name = display_name  # The name used in search should be the display_name only
+                    if "#" not in bungie_name:
+                        bungie_name = f"{display_name}#{membership_id.split('#')[0] if '#' in membership_id else membership_id}"
+
+                    user, membership_type = await self.api_client.search_player_by_name(bungie_name)
+
+                    if user and membership_type:
+                        # Get activities for all PvP modes using the correct membership type
+                        activities = await self.api_client.get_player_recent_activities(
+                            user=user,
+                            modes=list(self.api_client.game_mode_types.values()),
+                            count=10
+                        )
+
+                        if activities:
+                            # Queue activities for processing
+                            new_games = []
+                            for activity in activities:
+                                instance_id = activity.get("activityDetails", {}).get("instanceId")
+                                if instance_id and str(instance_id) != str(game_id):
+                                    new_games.append(str(instance_id))
+
+                            # Queue new games
+                            if new_games:
+                                count = self.queue_manager.queue_games(new_games, priority=0.5)
+                                queued_count += count
+                                self.stats["games_queued"] += count
+
+                    else:
+                        logger.warning(f"Could not determine correct platform for player {player_id}")
+
+                except Exception as e:
+                    logger.warning(f"Error processing connected games for {player_id}: {str(e)}")
+
+        except Exception as e:
+            logger.error(f"Error in queue_connected_games: {str(e)}")
+
+        return queued_count
+
+    async def worker(self, worker_id: int) -> None:
+        """Worker coroutine for processing games"""
+        logger.info(f"Worker {worker_id} started")
+
+        while self.running and not self.shutdown_event.is_set():
+            try:
+                # Get next game to process
+                game_id, _ = self.queue_manager.get_next_game()
+
+                if not game_id:
+                    # No games in queue, wait a bit
+                    await asyncio.sleep(1)
+                    continue
+
+                # Process game
+                await self.process_game(game_id)
+
+                # Prevent CPU hogging
+                await asyncio.sleep(0.1)
+
+            except Exception as e:
+                logger.error(f"Worker {worker_id} error: {str(e)}")
+                await asyncio.sleep(1)
+
+        logger.info(f"Worker {worker_id} stopped")
+
+    async def stats_reporter(self) -> None:
+        """Periodically report statistics"""
+        while self.running and not self.shutdown_event.is_set():
+            try:
+                # Calculate runtime
+                runtime = time.time() - self.stats["start_time"]
+                hours = int(runtime // 3600)
+                minutes = int((runtime % 3600) // 60)
+                seconds = int(runtime % 60)
+
+                # Log statistics
+                logger.info(f"=== Stats after {hours:02d}:{minutes:02d}:{seconds:02d} ===")
+                logger.info(f"Games processed: {self.stats['games_processed']}")
+                logger.info(f"Games queued: {self.stats['games_queued']}")
+                logger.info(f"Queue size: {self.queue_manager.queue_size()}")
+                logger.info(f"API errors: {self.stats['api_errors']}")
+
+                if runtime > 0:
+                    rate = self.stats['games_processed'] / runtime
+                    logger.info(f"Processing rate: {rate:.2f} games/second")
+
+                # Wait for next report
+                for _ in range(30):  # Report every 5 minutes, check shutdown every 10 seconds
+                    if self.shutdown_event.is_set():
+                        break
+                    await asyncio.sleep(10)
+
+            except Exception as e:
+                logger.error(f"Error in stats reporter: {str(e)}")
+                await asyncio.sleep(60)
+
+    def setup_signal_handlers(self) -> None:
         """Set up signal handlers for graceful shutdown"""
 
         def signal_handler(sig, frame):
@@ -173,37 +261,27 @@ class CheatDetector:
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
-    async def stats_reporter(self):
-        """Periodically report statistics"""
-        while self.running and not self.shutdown_event.is_set():
-            self.print_stats()
-            self.save_state()
-
-            try:
-                # Check every 10 seconds for shutdown, report every 5 minutes
-                for _ in range(30):
-                    if self.shutdown_event.is_set():
-                        break
-                    await asyncio.sleep(10)
-            except:
-                break
-
-    async def run(self):
-        """Main detector loop"""
-        logger.info("Starting Destiny 2 Cheat Detector")
+    async def run(self) -> None:
+        """Main pipeline entry point"""
+        logger.info("Starting Destiny 2 Cheat Detector Pipeline")
 
         self.setup_signal_handlers()
         self.running = True
 
         try:
             # Initialize
-            await self.initialize()
+            if not await self.initialize():
+                logger.error("Initialization failed!")
+                return
 
             # Start workers
-            self.start_workers()
+            workers = []
+            for i in range(self.worker_count):
+                worker_task = asyncio.create_task(self.worker(i))
+                workers.append(worker_task)
 
             # Start stats reporter
-            asyncio.create_task(self.stats_reporter())
+            stats_task = asyncio.create_task(self.stats_reporter())
 
             # Wait for shutdown signal
             while self.running and not self.shutdown_event.is_set():
@@ -211,19 +289,26 @@ class CheatDetector:
 
             logger.info("Shutting down...")
 
+            # Cancel all tasks
+            for worker_task in workers:
+                worker_task.cancel()
+
+            stats_task.cancel()
+
+            # Wait for tasks to complete
+            await asyncio.gather(*workers, stats_task, return_exceptions=True)
+
         except Exception as e:
-            logger.error(f"Error in main loop: {str(e)}")
+            logger.error(f"Error in main pipeline: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
 
         finally:
             self.running = False
-            self.stop_workers()
-            self.save_state("detector_final_state.json")
-            logger.info("Cheat detector shutdown complete")
+            logger.info("Cheat detector pipeline shutdown complete")
 
 
-async def main():
+async def main() -> None:
     """Main entry point"""
     parser = argparse.ArgumentParser(description="Destiny 2 Cheat Detector")
     parser.add_argument("--config", default="config.yml", help="Path to config file")
@@ -234,13 +319,13 @@ async def main():
     if args.debug:
         logging.getLogger("cheat_detector").setLevel(logging.DEBUG)
 
-    # Create and run detector
-    detector = CheatDetector(args.config)
-    await detector.run()
+    # Create and run pipeline
+    pipeline = CheatDetectorPipeline(args.config)
+    await pipeline.run()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nDetector stopped by user")
+        print("\nPipeline stopped by user")
