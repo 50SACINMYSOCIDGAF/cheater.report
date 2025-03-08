@@ -49,6 +49,7 @@ class GraphManager:
 
         # Queue for multi-threaded exploration
         self.match_queue = queue.PriorityQueue()
+        self.reported_cheaters = set()
 
     def add_match_data(self, match_id: str, player_metrics: Dict[str, Dict[str, Any]]) -> None:
         """Add match data to the graph"""
@@ -246,8 +247,10 @@ class GraphManager:
 
     def queue_match_for_analysis(self, match_id: str, priority: float = 0.0) -> None:
         """Add match to priority queue for analysis"""
-        if match_id not in self.visited_matches:
-            self.match_queue.put((priority, match_id))
+        # Ensure match_id is always a string
+        match_id_str = str(match_id)
+        if match_id_str not in self.visited_matches:
+            self.match_queue.put((priority, match_id_str))
 
     def get_next_queued_match(self, timeout: float = 0.1) -> Optional[str]:
         """Get next match from queue"""

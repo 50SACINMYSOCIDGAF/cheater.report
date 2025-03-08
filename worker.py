@@ -6,6 +6,9 @@ import time
 from typing import Dict, List, Any, Optional
 import traceback
 
+import aiohttp
+from bungio.models import DestinyPostGameCarnageReportData, BungieMembershipType, DestinyUser
+
 from bungio_client import BungioClient
 from graph_manager import GraphManager
 from bayesian_detector import BayesianDetector
@@ -18,7 +21,7 @@ class Worker(threading.Thread):
                  bayesian_detector: BayesianDetector, webhook_url: str, min_confidence: float = 0.9):
         super().__init__(name=f"Worker-{worker_id}")
         self.worker_id = worker_id
-        self.api_client = api_client
+        self.api_client = api_client  # Original client for reference
         self.graph_manager = graph_manager
         self.bayesian_detector = bayesian_detector
         self.webhook_url = webhook_url
@@ -27,6 +30,7 @@ class Worker(threading.Thread):
         self.daemon = True
         self.running = True
         self.loop = None
+        self.worker_client = None  # Worker-specific API client
 
         self.stats = {
             "matches_processed": 0,
@@ -39,8 +43,14 @@ class Worker(threading.Thread):
     def run(self):
         """Thread main function"""
         try:
+            # Create a new event loop for this thread
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
+
+            # Initialize worker's own HTTP client
+            self.loop.run_until_complete(self._init_worker_client())
+
+            # Run the main worker loop
             self.loop.run_until_complete(self.worker_loop())
         except Exception as e:
             logger.error(f"Worker {self.worker_id} crashed: {str(e)}")
@@ -48,6 +58,12 @@ class Worker(threading.Thread):
         finally:
             if self.loop:
                 self.loop.close()
+
+    async def _init_worker_client(self):
+        """Initialize worker-specific resources"""
+        # Clone necessary settings from main client
+        self.worker_client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        logger.info(f"Worker {self.worker_id} initialized with dedicated HTTP client")
 
     async def worker_loop(self):
         """Main worker loop for processing matches"""
@@ -77,7 +93,7 @@ class Worker(threading.Thread):
                 success = await self.process_match(match_id)
 
                 if success:
-                    # Occasionally check for cheaters
+                    # Check for cheaters after every few matches
                     if self.stats["matches_processed"] % 5 == 0:
                         await self.detect_and_report_cheaters()
 
@@ -85,7 +101,7 @@ class Worker(threading.Thread):
                     if self.stats["matches_processed"] % 10 == 0:
                         self.graph_manager.cleanup_attention_window()
 
-                # Prevent CPU hogging when processing lots of cached data
+                # Prevent CPU hogging
                 await asyncio.sleep(0.01)
 
             except Exception as e:
@@ -98,13 +114,16 @@ class Worker(threading.Thread):
         try:
             self.stats["last_activity"] = time.time()
 
-            # Get PGCR data
-            pgcr_data = await self.api_client.get_pgcr(match_id)
+            # Get PGCR data using direct API call with worker's session
+            pgcr_raw = await self.api_client.get_pgcr_direct(match_id, self.worker_client)
 
-            if not pgcr_data:
+            if not pgcr_raw:
                 logger.warning(f"No PGCR data found for match {match_id}")
                 self.stats["api_errors"] += 1
                 return False
+
+            # Convert raw PGCR to the expected format
+            pgcr_data = self._convert_pgcr(pgcr_raw, match_id)
 
             # Extract player metrics
             player_metrics = await self.api_client.extract_player_metrics(pgcr_data)
@@ -115,6 +134,9 @@ class Worker(threading.Thread):
 
             # Update graph
             self.graph_manager.add_match_data(match_id, player_metrics)
+
+            # Check for high win rates in the most suspicious players
+            await self.analyze_win_rates(player_metrics)
 
             # Find and queue connected matches
             await self.queue_connected_matches(match_id, player_metrics)
@@ -129,60 +151,137 @@ class Worker(threading.Thread):
             logger.error(traceback.format_exc())
             return False
 
+    def _convert_pgcr(self, pgcr_raw: Dict, activity_id: str) -> DestinyPostGameCarnageReportData:
+        """Convert raw PGCR data to the expected format"""
+        pgcr = DestinyPostGameCarnageReportData(
+            activity_details=pgcr_raw.get("activityDetails", {}),
+            activity_was_started_from_beginning=pgcr_raw.get("activityWasStartedFromBeginning", True),
+            entries=pgcr_raw.get("entries", []),
+            period=pgcr_raw.get("period", ""),
+            starting_phase_index=pgcr_raw.get("startingPhaseIndex", 0),
+            teams=pgcr_raw.get("teams", [])
+        )
+
+        # Set additional properties that might not be required by the constructor
+        pgcr.activity_duration_seconds = pgcr_raw.get("activityDurationSeconds", 0)
+        return pgcr
+
     async def queue_connected_matches(self, current_match_id: str, player_metrics: Dict[str, Dict[str, Any]]) -> None:
-        """Find and queue matches connected to players in the current match"""
+        """Find and queue matches connected to players in the current match using branching search"""
         try:
-            # First get player suspicion scores to prioritize
-            max_player_suspicion = 0.0
-            for player in player_metrics:
-                suspicion = self.graph_manager.player_suspicion.get(player, 0.0)
-                max_player_suspicion = max(max_player_suspicion, suspicion)
-
-            # For each player, look through their recent history
+            # Sort players by suspicion
+            players_with_suspicion = []
             for player_id in player_metrics:
-                # Skip if player not suspicious enough
-                player_suspicion = self.graph_manager.player_suspicion.get(player_id, 0.0)
-                if player_suspicion < 0.1 and max_player_suspicion > 0.4:
-                    continue
+                if "#" in player_id:
+                    suspicion = self.graph_manager.player_suspicion.get(player_id, 0.0)
+                    players_with_suspicion.append((player_id, suspicion))
 
-                if "#" not in player_id:
-                    continue
+            # Sort by suspicion (highest first)
+            players_with_suspicion.sort(key=lambda x: x[1], reverse=True)
 
-                display_name, membership_id = player_id.split("#", 1)
+            # Determine branching factor based on max suspicion
+            max_suspicion = players_with_suspicion[0][1] if players_with_suspicion else 0
+            branching_factor = 2  # Default low branching
+
+            if max_suspicion > 0.5:
+                branching_factor = 4  # Increase for suspicious players
+            if max_suspicion > 0.8:
+                branching_factor = 6  # High branching for likely cheaters
+
+            # Only process top N players based on branching factor
+            for player_id, suspicion in players_with_suspicion[:branching_factor]:
                 try:
-                    # Create BungIO user
-                    from bungio.models import DestinyUser, BungieMembershipType
+                    # Extract membership info
+                    display_name, membership_id = player_id.split("#", 1)
 
                     # Try different membership types
-                    for membership_type in [
-                        BungieMembershipType.TIGER_STEAM,
-                        BungieMembershipType.TIGER_PSN,
-                        BungieMembershipType.TIGER_XBOX
-                    ]:
+                    for membership_type in [3, 2, 1]:  # Steam, PSN, Xbox
                         try:
-                            user = DestinyUser(
-                                membership_id=membership_id,
-                                membership_type=membership_type
-                            )
+                            # Direct API call for recent activities
+                            headers = {"X-API-Key": self.api_client.api_key}
 
-                            # Get activities for all PvP modes
-                            activities = await self.api_client.get_player_recent_activities(
-                                user=user,
-                                modes=list(self.api_client.game_mode_types.values()),
-                                count=10
-                            )
+                            # First get character IDs
+                            profile_url = f"https://www.bungie.net/Platform/Destiny2/{membership_type}/Profile/{membership_id}/?components=Characters"
 
-                            if activities:
-                                # Queue activities for exploration
-                                for activity in activities:
-                                    instance_id = activity.get("activityDetails", {}).get("instanceId")
-                                    if instance_id and instance_id != current_match_id:
-                                        # Higher suspicion = higher priority (negative for priority queue)
-                                        priority = -player_suspicion
-                                        self.graph_manager.queue_match_for_analysis(instance_id, priority)
+                            async with self.worker_client.get(profile_url, headers=headers, timeout=10) as response:
+                                if response.status != 200:
+                                    continue
 
-                                # Found activities for this user, move on
-                                break
+                                profile_data = await response.json()
+
+                                if profile_data.get("ErrorCode", 0) != 1:
+                                    continue
+
+                                characters_data = profile_data.get("Response", {}).get("characters", {}).get("data", {})
+
+                                if not characters_data:
+                                    continue
+
+                                # Get activity count based on suspicion
+                                activity_count = int(5 + suspicion * 15)  # 5-20 activities
+                                matches_found = 0
+
+                                # Check each character
+                                for character_id in characters_data:
+                                    # For each relevant mode
+                                    for mode in [84, 69, 80]:  # trials, competitive, elimination
+                                        try:
+                                            history_url = f"https://www.bungie.net/Platform/Destiny2/{membership_type}/Account/{membership_id}/Character/{character_id}/Stats/Activities/"
+                                            params = {
+                                                "count": activity_count,
+                                                "mode": mode,
+                                                "page": 0
+                                            }
+
+                                            async with self.worker_client.get(history_url, headers=headers,
+                                                                              params=params,
+                                                                              timeout=10) as history_response:
+                                                if history_response.status != 200:
+                                                    continue
+
+                                                history_data = await history_response.json()
+
+                                                if history_data.get("ErrorCode", 0) != 1:
+                                                    continue
+
+                                                activities = history_data.get("Response", {}).get("activities", [])
+
+                                                for activity in activities:
+                                                    instance_id = activity.get("activityDetails", {}).get("instanceId")
+
+                                                    if instance_id and str(instance_id) != str(current_match_id):
+                                                        # Calculate priority - higher suspicion = higher priority
+                                                        priority = -suspicion  # Negative for priority queue
+
+                                                        # Prioritize by mode (trials first)
+                                                        activity_mode = activity.get("activityDetails", {}).get("mode",
+                                                                                                                0)
+                                                        if activity_mode == 84:  # Trials
+                                                            priority -= 0.3
+                                                        elif activity_mode == 69:  # Competitive
+                                                            priority -= 0.1
+
+                                                        self.graph_manager.queue_match_for_analysis(str(instance_id),
+                                                                                                    priority)
+                                                        matches_found += 1
+
+                                                        if matches_found >= activity_count:
+                                                            break
+
+                                            if matches_found >= activity_count:
+                                                break
+
+                                        except Exception as e:
+                                            logger.debug(
+                                                f"Error getting activities for character {character_id}, mode {mode}: {str(e)}")
+
+                                    if matches_found >= activity_count:
+                                        break
+
+                                if matches_found > 0:
+                                    logger.debug(
+                                        f"Queued {matches_found} matches from {player_id} (suspicion: {suspicion:.2f})")
+                                    break  # Found valid profile, stop checking other platforms
 
                         except Exception as e:
                             logger.debug(
@@ -202,25 +301,37 @@ class Worker(threading.Thread):
 
             # Report new cheaters
             for player, score in confirmed_cheaters:
-                if score >= self.min_confidence:
+                if (score >= self.min_confidence and
+                        player not in self.graph_manager.reported_cheaters):
+
                     # Get evidence
                     evidence_matches, flags = self.graph_manager.get_player_evidence(player)
 
-                    # Send Discord alert
-                    await self.api_client.send_discord_alert(
-                        self.webhook_url,
-                        player,
-                        evidence_matches[:5],
-                        score,
-                        flags
-                    )
+                    # Add win rate flags if available
+                    for metric_name, values in self.graph_manager.player_metrics.get(player, {}).items():
+                        if "_win_rate" in metric_name and values:
+                            mode = metric_name.replace("_win_rate", "")
+                            flags[metric_name] = f"{values[0]:.1%}"
 
-                    self.stats["cheaters_detected"] += 1
-                    logger.info(f"Worker {self.worker_id} detected cheater: {player} with score {score:.3f}")
+                    # Send Discord alert
+                    if evidence_matches:
+                        await self.api_client.send_discord_alert(
+                            self.webhook_url,
+                            player,
+                            evidence_matches[:5],
+                            score,
+                            flags
+                        )
+
+                        # Mark as reported
+                        with self.graph_manager.graph_lock:
+                            self.graph_manager.reported_cheaters.add(player)
+
+                        self.stats["cheaters_detected"] += 1
+                        logger.info(f"Worker {self.worker_id} detected cheater: {player} with score {score:.3f}")
 
         except Exception as e:
             logger.error(f"Error in cheater detection: {str(e)}")
-            logger.error(traceback.format_exc())
 
     def stop(self):
         """Signal worker to stop"""
