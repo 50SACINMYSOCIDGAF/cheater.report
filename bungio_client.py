@@ -474,16 +474,36 @@ class BungioClient:
         try:
             # Create embed with evidence
             embed = {
-                "title": f"🚨 Possible Cheater Detected: {player_name}",
+                "title": f"🚨 Cheater Detected: {player_name}",
                 "color": 16711680,  # Red
-                "description": f"Suspicion Score: {suspicion_score:.2f}/1.00\n\n**Suspicious Activities:**",
+                "description": f"Suspicion Score: **{suspicion_score:.2f}/1.00**\n\n" +
+                               f"This player has been flagged for suspicious activity.",
                 "fields": []
             }
 
-            # Add flags as fields
+            # Summarize key issues first
+            serious_issues = []
+            if "headshot_anomalies" in flags:
+                serious_issues.append("Abnormally high headshot ratio")
+            if "heavy_ammo_anomalies" in flags:
+                serious_issues.append("Suspicious heavy ammo usage")
+            if "game_duration_anomalies" in flags:
+                serious_issues.append("Suspiciously fast matches")
+            if "kill_streak_anomalies" in flags:
+                serious_issues.append("Unusual kill streaks")
+
+            if serious_issues:
+                summary = "**Key Issues:**\n" + "\n".join(f"- {issue}" for issue in serious_issues)
+                embed["fields"].append({
+                    "name": "Summary",
+                    "value": summary,
+                    "inline": False
+                })
+
+            # Add detailed flags as fields
             for flag_type, details in flags.items():
                 if isinstance(details, dict):
-                    value = "\n".join(f"- {k}: {v}" for k, v in details.items())
+                    value = "\n".join(f"- **{k}**: {v}" for k, v in details.items())
                 else:
                     value = str(details)
 
@@ -503,8 +523,12 @@ class BungioClient:
                 "inline": False
             })
 
+            # Add timestamp for tracking
+            from datetime import datetime
+            embed["timestamp"] = datetime.utcnow().isoformat()
+
             payload = {
-                "content": f"Possible cheater detected: {player_name}",
+                "content": f"Cheater detected: **{player_name}**",
                 "embeds": [embed]
             }
 
@@ -518,3 +542,25 @@ class BungioClient:
 
         except Exception as e:
             logger.error(f"Error sending Discord alert: {str(e)}")
+
+    async def get_pgcr_direct(self, activity_id: str, session: aiohttp.ClientSession) -> Optional[Dict]:
+        """Direct API call to get PGCR data without using bungio client"""
+        try:
+            headers = {"X-API-Key": self.api_key}
+            url = f"https://www.bungie.net/Platform/Destiny2/Stats/PostGameCarnageReport/{activity_id}/"
+
+            async with session.get(url, headers=headers, timeout=15) as response:
+                if response.status != 200:
+                    logger.warning(f"PGCR API returned {response.status} for {activity_id}")
+                    return None
+
+                data = await response.json()
+
+                if data.get("ErrorCode", 0) != 1:
+                    logger.warning(f"PGCR API error: {data.get('ErrorStatus')} for {activity_id}")
+                    return None
+
+                return data["Response"]
+        except Exception as e:
+            logger.error(f"Error in direct PGCR request for {activity_id}: {str(e)}")
+            return None
