@@ -49,8 +49,12 @@ class DataProcessor:
                     if not player or "destinyUserInfo" not in player:
                         continue
 
-                    # Create unique player ID
-                    player_id = f"{player['destinyUserInfo'].get('displayName', 'Unknown')}#{player['destinyUserInfo'].get('membershipId', '0')}"
+                    # Extract player info - Store just the displayName as key to avoid issues with the format
+                    display_name = player['destinyUserInfo'].get('displayName', 'Unknown')
+                    membership_id = player['destinyUserInfo'].get('membershipId', '0')
+
+                    # Create player ID in a reliable format that can be parsed later
+                    player_id = f"{display_name}#{membership_id}"
 
                     # Extract basic stats
                     values = entry.get("values", {})

@@ -11,6 +11,8 @@ from typing import List, Dict, Any, Optional
 import signal
 import threading
 
+from bungio.models import DestinyUser
+
 from bungio_client import BungioClient
 from data_processor import DataProcessor
 from queue_mananger import QueueManager
@@ -146,44 +148,78 @@ class CheatDetectorPipeline:
         try:
             # For each player, get their recent games
             for player_id in player_metrics:
-                # Skip if invalid player ID
+                # Skip if invalid player ID format
                 if "#" not in player_id:
                     continue
 
-                display_name, membership_id = player_id.split("#", 1)
-
                 try:
-                    # Search for the player to get the correct membership type
-                    bungie_name = display_name  # The name used in search should be the display_name only
-                    if "#" not in bungie_name:
-                        bungie_name = f"{display_name}#{membership_id.split('#')[0] if '#' in membership_id else membership_id}"
+                    # Parse player ID from format: "DisplayName#MembershipID"
+                    display_name, membership_id_str = player_id.split("#", 1)
 
-                    user, membership_type = await self.api_client.search_player_by_name(bungie_name)
+                    # Check if the part after # is a numeric membership ID (not a Bungie name code)
+                    if membership_id_str.isdigit() and len(membership_id_str) > 10:  # Membership IDs are long numbers
+                        # Use get_player_by_membership_id instead of trying each platform manually
+                        # This will search for the correct platform based on membership ID
+                        user, membership_type = await self.api_client.get_player_by_membership_id(membership_id_str)
 
-                    if user and membership_type:
-                        # Get activities for all PvP modes using the correct membership type
-                        activities = await self.api_client.get_player_recent_activities(
-                            user=user,
-                            modes=list(self.api_client.game_mode_types.values()),
-                            count=10
-                        )
+                        if user and membership_type:
+                            logger.info(
+                                f"Found correct platform {membership_type.name} for player {display_name} with ID {membership_id_str}")
 
-                        if activities:
-                            # Queue activities for processing
-                            new_games = []
-                            for activity in activities:
-                                instance_id = activity.get("activityDetails", {}).get("instanceId")
-                                if instance_id and str(instance_id) != str(game_id):
-                                    new_games.append(str(instance_id))
+                            # Get activities using the correct platform
+                            activities = await self.api_client.get_player_recent_activities(
+                                user=user,
+                                modes=list(self.api_client.game_mode_types.values()),
+                                count=10
+                            )
 
-                            # Queue new games
-                            if new_games:
-                                count = self.queue_manager.queue_games(new_games, priority=0.5)
-                                queued_count += count
-                                self.stats["games_queued"] += count
+                            if activities:
+                                # Queue activities for processing
+                                new_games = []
+                                for activity in activities:
+                                    instance_id = activity.get("activityDetails", {}).get("instanceId")
+                                    if instance_id and str(instance_id) != str(game_id):
+                                        new_games.append(str(instance_id))
+
+                                # Queue new games
+                                if new_games:
+                                    count = self.queue_manager.queue_games(new_games, priority=0.5)
+                                    queued_count += count
+                                    self.stats["games_queued"] += count
+                        else:
+                            logger.warning(
+                                f"Could not find valid platform for player {display_name} with ID {membership_id_str}")
 
                     else:
-                        logger.warning(f"Could not determine correct platform for player {player_id}")
+                        # This is likely a regular Bungie name format (DisplayName#Code)
+                        bungie_name = player_id.split("#")[0]  # Just use the display name part
+
+                        # Get player using standard search
+                        user, membership_type = await self.api_client.search_player_by_name(bungie_name)
+
+                        if user and membership_type:
+                            # Get activities for found player
+                            activities = await self.api_client.get_player_recent_activities(
+                                user=user,
+                                modes=list(self.api_client.game_mode_types.values()),
+                                count=10
+                            )
+
+                            if activities:
+                                # Queue activities for processing
+                                new_games = []
+                                for activity in activities:
+                                    instance_id = activity.get("activityDetails", {}).get("instanceId")
+                                    if instance_id and str(instance_id) != str(game_id):
+                                        new_games.append(str(instance_id))
+
+                                # Queue new games
+                                if new_games:
+                                    count = self.queue_manager.queue_games(new_games, priority=0.5)
+                                    queued_count += count
+                                    self.stats["games_queued"] += count
+                        else:
+                            logger.warning(f"Could not find player by Bungie name: {bungie_name}")
 
                 except Exception as e:
                     logger.warning(f"Error processing connected games for {player_id}: {str(e)}")
@@ -192,6 +228,8 @@ class CheatDetectorPipeline:
             logger.error(f"Error in queue_connected_games: {str(e)}")
 
         return queued_count
+
+
 
     async def worker(self, worker_id: int) -> None:
         """Worker coroutine for processing games"""

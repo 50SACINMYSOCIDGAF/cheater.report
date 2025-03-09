@@ -101,18 +101,93 @@ class BungioClient:
 
     async def search_player_by_name(self, name: str) -> Tuple[Optional[DestinyUser], Optional[BungieMembershipType]]:
         """Search for a player by their Bungie name and return both the user and the correct membership type"""
+        # Check if this is actually a membership ID instead of a name
+        if name.isdigit() and len(name) > 10:
+            return await self.get_player_by_membership_id(name)
+
+        # Check cache for regular name search
         if name in self.player_cache:
             cached_user, cached_membership_type = self.player_cache[name]
             return cached_user, cached_membership_type
 
         try:
-            # Parse Bungie name
-            if "#" in name:
-                display_name, display_name_code = name.split("#", 1)
-            else:
-                display_name = name
-                display_name_code = "0"
+            # Parse Bungie name - handle multiple formats
+            display_name = name
+            display_name_code = "0"
 
+            if "#" in name:
+                name_parts = name.split("#", 1)
+                display_name = name_parts[0]
+                # Only use the code part if it looks like a Bungie name code (not a membership ID)
+                if len(name_parts[1]) <= 5 and name_parts[1].isdigit():
+                    display_name_code = name_parts[1]
+
+            # Use BungieMembershipType.All (value 254) to search across all platforms at once
+            try:
+                headers = {"X-API-Key": self.api_key}
+
+                # Construct the request body
+                body = {
+                    "displayName": display_name,
+                    "displayNameCode": display_name_code
+                }
+
+                # Use aiohttp to make the direct API call
+                async with aiohttp.ClientSession() as session:
+                    # Search across all platforms with BungieMembershipType.All (254)
+                    url = f"https://www.bungie.net/Platform/Destiny2/SearchDestinyPlayerByBungieName/254/"
+                    async with session.post(url, json=body, headers=headers) as response:
+                        if response.status != 200:
+                            logger.debug(f"Player search API returned status {response.status}")
+                            return None, None
+
+                        data = await response.json()
+
+                        if data.get("ErrorCode", 0) != 1 or not data.get("Response"):
+                            logger.debug(f"Player {name} not found on any platform")
+                            return None, None
+
+                        # Try each result until we find an active Destiny 2 account
+                        for player_data in data["Response"]:
+                            # Get the actual membership type from the response
+                            actual_membership_type = BungieMembershipType(player_data["membershipType"])
+
+                            # Create DestinyUser object with the correct membership type
+                            user = DestinyUser(
+                                membership_id=player_data["membershipId"],
+                                membership_type=actual_membership_type
+                            )
+
+                            # Verify account exists by checking for characters
+                            try:
+                                # Check if profile has characters
+                                profile = await self._rate_limited_request(
+                                    user.get_profile(components=["Characters"])
+                                )
+
+                                if profile and profile.characters and profile.characters.data:
+                                    # Valid profile found
+                                    logger.info(
+                                        f"Found player {name} with ID {user.membership_id} on platform {actual_membership_type.name}")
+
+                                    # Cache result with correct membership type
+                                    self.player_cache[name] = (user, actual_membership_type)
+
+                                    # Maintain cache size
+                                    if len(self.player_cache) > self.max_cache_size:
+                                        self.player_cache.popitem(last=False)
+
+                                    return user, actual_membership_type
+
+                            except Exception as e:
+                                logger.debug(
+                                    f"Profile check failed for {name} on platform {actual_membership_type.name}: {str(e)}")
+                                continue
+
+            except Exception as e:
+                logger.debug(f"Error searching for player {name} using BungieMembershipType.All: {str(e)}")
+
+            # If BungieMembershipType.All approach fails, fall back to the platform-by-platform approach
             # List of membership types to try
             # 3=Steam, 1=Xbox, 2=PSN, 6=Epic Games, 5=Stadia
             membership_types = [3, 1, 2, 6, 5]
@@ -343,6 +418,121 @@ class BungioClient:
             logger.error(f"Error getting recent activities: {str(e)}")
             return []
 
+    async def get_player_by_membership_id(self, membership_id: str) -> Tuple[
+        Optional[DestinyUser], Optional[BungieMembershipType]]:
+        """Try to find a valid platform for a membership ID by trying each platform type"""
+
+        # Check cache first
+        cache_key = f"mid:{membership_id}"
+        if cache_key in self.player_cache:
+            cached_user, cached_membership_type = self.player_cache[cache_key]
+            return cached_user, cached_membership_type
+
+        try:
+            # First try to use the GetMembershipsById endpoint to get all memberships
+            headers = {"X-API-Key": self.api_key}
+            url = f"https://www.bungie.net/Platform/User/GetMembershipsById/{membership_id}/254/"
+
+            async with aiohttp.ClientSession() as session:
+                async with self.request_lock:
+                    # Implement rate limiting
+                    now = time.time()
+                    self.request_times = [t for t in self.request_times if now - t < 1.0]
+
+                    if len(self.request_times) >= self.rate_limit:
+                        wait_time = 1.0 - (now - self.request_times[0])
+                        if wait_time > 0:
+                            await asyncio.sleep(wait_time)
+
+                    self.request_times.append(time.time())
+
+                    # Make the request
+                    async with session.get(url, headers=headers) as response:
+                        if response.status == 200:
+                            data = await response.json()
+
+                            if data.get("ErrorCode", 0) == 1 and data.get("Response"):
+                                # Get the destiny memberships
+                                destiny_memberships = data["Response"].get("destinyMemberships", [])
+
+                                # Try each membership
+                                for membership in destiny_memberships:
+                                    platform = BungieMembershipType(membership["membershipType"])
+
+                                    # Create a user with this platform type
+                                    user = DestinyUser(
+                                        membership_id=membership["membershipId"],
+                                        membership_type=platform
+                                    )
+
+                                    # Verify if this combination is valid
+                                    try:
+                                        profile = await self._rate_limited_request(
+                                            user.get_profile(components=["Characters"])
+                                        )
+
+                                        if profile and profile.characters and profile.characters.data:
+                                            logger.info(
+                                                f"Found valid platform {platform.name} for membership ID {membership_id}")
+
+                                            # Cache the result
+                                            self.player_cache[cache_key] = (user, platform)
+
+                                            # Maintain cache size
+                                            if len(self.player_cache) > self.max_cache_size:
+                                                self.player_cache.popitem(last=False)
+
+                                            return user, platform
+                                    except Exception as e:
+                                        logger.debug(
+                                            f"Platform {platform.name} invalid for membership ID {membership_id}: {str(e)}")
+                                        continue
+        except Exception as e:
+            logger.debug(f"Error using GetMembershipsById for {membership_id}: {str(e)}")
+
+        # If the above approach fails, fall back to trying each platform individually
+        # Try each membership type
+        for platform in [
+            BungieMembershipType.TIGER_STEAM,  # 3
+            BungieMembershipType.TIGER_XBOX,  # 1
+            BungieMembershipType.TIGER_PSN,  # 2
+            BungieMembershipType.TIGER_EPIC,  # 6
+            BungieMembershipType.TIGER_STADIA  # 5
+        ]:
+            try:
+                # Create a user with this platform type
+                user = DestinyUser(
+                    membership_id=membership_id,
+                    membership_type=platform
+                )
+
+                # Try to get profile to verify if this combination is valid
+                try:
+                    profile = await self._rate_limited_request(
+                        user.get_profile(components=["Characters"])
+                    )
+
+                    if profile and profile.characters and profile.characters.data:
+                        logger.info(f"Found valid platform {platform.name} for membership ID {membership_id}")
+
+                        # Cache the result
+                        self.player_cache[cache_key] = (user, platform)
+
+                        # Maintain cache size
+                        if len(self.player_cache) > self.max_cache_size:
+                            self.player_cache.popitem(last=False)
+
+                        return user, platform
+                except Exception as e:
+                    logger.debug(f"Platform {platform.name} invalid for membership ID {membership_id}: {str(e)}")
+                    continue
+
+            except Exception as e:
+                logger.debug(f"Error checking membership ID {membership_id} on platform {platform.name}: {str(e)}")
+
+        logger.warning(f"Could not find valid platform for membership ID {membership_id}")
+        return None, None
+
     async def get_seed_matches_from_cheaters(self, cheater_names: List[str]) -> List[str]:
         """Get recent match IDs from a list of known cheaters"""
         seed_matches = set()
@@ -428,3 +618,45 @@ class BungioClient:
             seed_matches.update(fallback_matches)
 
         return list(seed_matches)
+
+    async def get_player_weapon_stats(self, user: DestinyUser, character_id: str) -> Dict[str, Any]:
+        """Get detailed weapon stats for a specific character of a player"""
+        try:
+            headers = {"X-API-Key": self.api_key}
+            membership_type_value = user.membership_type.value
+            membership_id = user.membership_id
+
+            url = f"https://www.bungie.net/Platform/Destiny2/{membership_type_value}/Account/{membership_id}/Character/{character_id}/Stats/UniqueWeapons/"
+
+            logger.debug(f"Fetching weapon stats for character {character_id} of player {membership_id}")
+
+            async with aiohttp.ClientSession() as session:
+                async with self.request_lock:
+                    # Implement rate limiting
+                    now = time.time()
+                    self.request_times = [t for t in self.request_times if now - t < 1.0]
+
+                    if len(self.request_times) >= self.rate_limit:
+                        wait_time = 1.0 - (now - self.request_times[0])
+                        if wait_time > 0:
+                            await asyncio.sleep(wait_time)
+
+                    self.request_times.append(time.time())
+
+                    # Make the request
+                    async with session.get(url, headers=headers) as response:
+                        if response.status != 200:
+                            logger.warning(f"Weapon stats API returned status {response.status}")
+                            return {}
+
+                        data = await response.json()
+
+                        if data.get("ErrorCode", 0) != 1 or not data.get("Response"):
+                            logger.warning(f"No weapon stats found for character {character_id}")
+                            return {}
+
+                        return data["Response"]
+
+        except Exception as e:
+            logger.error(f"Error getting weapon stats for character {character_id}: {str(e)}")
+            return {}
